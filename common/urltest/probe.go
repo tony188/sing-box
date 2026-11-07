@@ -23,7 +23,8 @@ type confirmingKey struct{}
 
 // WithNewerThan makes Probe accept any result for the member completed after t,
 // even under force, and join one in flight: "a result newer than the failure" is
-// the recheck, whoever produced it (Open-Box tcp14, see confirm.go).
+// the recheck, whoever produced it (Open-Box tcp14, see confirm.go). "After" counts
+// whole milliseconds, see newerThan.
 func WithNewerThan(ctx context.Context, t time.Time) context.Context {
 	return context.WithValue(ctx, newerThanKey{}, t)
 }
@@ -31,6 +32,20 @@ func WithNewerThan(ctx context.Context, t time.Time) context.Context {
 func newerThanOf(ctx context.Context) time.Time {
 	t, _ := ctx.Value(newerThanKey{}).(time.Time)
 	return t
+}
+
+// newerThan reports whether a result completed at t is newer than bound, in whole
+// milliseconds (Open-Box tcp21). The panel's and the App's failover recheck send the
+// failure they saw as `since` in unix milliseconds, all the Clash API's result time
+// gives them, and the failure itself completed somewhere inside that millisecond.
+// Compared to the nanosecond (tcp14-tcp20), the failure counted as newer than itself:
+// the recheck got the very failure back instead of a probe, so a member no URL test
+// group was using was never tested again and the lane switched even when the node
+// had recovered. The kernel's own recheck passes its exact failure time; a result
+// finishing later within that same millisecond does not count either, which costs
+// at most one more probe.
+func newerThan(t, bound time.Time) bool {
+	return !bound.IsZero() && t.UnixMilli() > bound.UnixMilli()
 }
 
 // withConfirming marks the recheck confirm.go runs itself: its failure is judged
@@ -69,8 +84,7 @@ func (s *HistoryStorage) Probe(ctx context.Context, tag, link string, interval t
 		select {
 		case <-entry.done:
 			age := time.Since(entry.result.Time)
-			newer := newerThanOf(ctx)
-			if (!newer.IsZero() && entry.result.Time.After(newer)) || (!force && age >= 0 && age < interval) {
+			if newerThan(entry.result.Time, newerThanOf(ctx)) || (!force && age >= 0 && age < interval) {
 				result := entry.result
 				result.Reused = true
 				s.probeAccess.Unlock()
