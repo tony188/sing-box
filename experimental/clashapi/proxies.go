@@ -247,10 +247,38 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		if leaf, loaded := server.outbound.Outbound(realTag); loaded {
 			proxy = leaf
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeout))
-		defer cancel()
+		// Open-Box (tcp14): the probe waits for a slot in the kernel-wide probe budget
+		// (common/urltest/pacer.go); `timeout` bounds the probe itself, not the wait.
+		// `priority` = interactive (default: someone is waiting for it), background,
+		// or critical (never queued: keeping traffic flowing).
+		priority := urltest.PriorityInteractive
+		if value := query.Get("priority"); value != "" {
+			var ok bool
+			priority, ok = urltest.ParseProbePriority(value)
+			if !ok {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, ErrBadRequest)
+				return
+			}
+		}
+		probeTimeout := time.Millisecond * time.Duration(timeout)
+		ctx := urltest.WithPriority(context.Background(), priority)
+		// `since` (unix ms): any result for this member completed after it counts,
+		// even with force, and one in flight is joined — a recheck of a failure seen at
+		// `since` is shared with the kernel's own recheck instead of probing twice.
+		if value := query.Get("since"); value != "" {
+			since, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || since <= 0 {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, ErrBadRequest)
+				return
+			}
+			ctx = urltest.WithNewerThan(ctx, time.UnixMilli(since))
+		}
 		result := server.urlTestHistory.Probe(ctx, realTag, url, time.Millisecond*time.Duration(interval), force, func(ctx context.Context) (uint16, error) {
-			return urltest.URLTest(ctx, url, proxy)
+			probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+			defer cancel()
+			return urltest.URLTest(probeCtx, url, proxy)
 		})
 		delay, err := result.Delay, result.Err
 		defer func() {
@@ -266,15 +294,21 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			}
 		}()
 
+		// Open-Box (tcp14): the raw error goes back too, so the panel can say why a node
+		// failed (refused / TLS / DNS / closed ...) without probing it a second time.
+		errText := ""
+		if err != nil {
+			errText = err.Error()
+		}
 		if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
 			render.Status(r, http.StatusGatewayTimeout)
-			render.JSON(w, r, render.M{"message": "Timeout", "time": result.Time, "reused": result.Reused})
+			render.JSON(w, r, render.M{"message": "Timeout", "error": errText, "time": result.Time, "reused": result.Reused})
 			return
 		}
 
 		if err != nil || delay == 0 {
 			render.Status(r, http.StatusServiceUnavailable)
-			render.JSON(w, r, render.M{"message": "An error occurred in the delay test", "time": result.Time, "reused": result.Reused})
+			render.JSON(w, r, render.M{"message": "An error occurred in the delay test", "error": errText, "time": result.Time, "reused": result.Reused})
 			return
 		}
 

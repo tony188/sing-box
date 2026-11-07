@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -94,16 +95,28 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		}
 
 		// `timeout` is each member's own probe timeout (the panel's latency test setting),
-		// as in the Clash API where every proxy in a group is tested with that bound. The
-		// request itself gets enough room for all members: the batch probes ten at a time,
-		// so a group with many dead members needs ceil(n/10) waves of that timeout.
+		// as in the Clash API where every proxy in a group is tested with that bound.
+		// Open-Box (tcp14): members queue in the kernel-wide probe budget
+		// (common/urltest/pacer.go) and each one's timeout starts once it probes, so the
+		// request lasts as long as its members need; the caller bounds the wait, and
+		// members not started when it gives up are simply not tested (no failure).
+		// `priority` defaults to interactive for a forced (manual) check and to
+		// background for a scheduled one (force=false).
 		memberTimeout := time.Millisecond * time.Duration(timeout)
-		members := len(outboundGroup.All())
-		waves := (members + 9) / 10
-		if waves < 1 {
-			waves = 1
+		priority := urltest.PriorityBackground
+		if force {
+			priority = urltest.PriorityInteractive
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), memberTimeout*time.Duration(waves)+5*time.Second)
+		if value := query.Get("priority"); value != "" {
+			var ok bool
+			priority, ok = urltest.ParseProbePriority(value)
+			if !ok {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, ErrBadRequest)
+				return
+			}
+		}
+		ctx, cancel := context.WithTimeout(urltest.WithPriority(r.Context(), priority), 15*time.Minute)
 		defer cancel()
 
 		var result map[string]uint16
@@ -125,6 +138,12 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
+		// Open-Box (tcp14): the result lists every member that passed in a finished
+		// check (a check already running is joined, not answered empty), so a member
+		// missing from it failed. Older kernels do not send this header.
+		if ctx.Err() == nil {
+			w.Header().Set("X-Openbox-Group-Check", "complete")
+		}
 		render.JSON(w, r, result)
 	}
 }

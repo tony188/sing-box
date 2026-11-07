@@ -26,6 +26,10 @@ type HistoryStorage struct {
 	access       sync.RWMutex
 	delayHistory map[string]*adapter.URLTestHistory
 	updateHooks  []*observable.Subscriber[struct{}]
+	confirmOnce  sync.Once
+	confirm      *confirmRegistry
+	pacerOnce    sync.Once
+	pacer        *probePacer
 }
 
 func NewHistoryStorage() *HistoryStorage {
@@ -76,6 +80,7 @@ func (s *HistoryStorage) notifyUpdated() {
 }
 
 func (s *HistoryStorage) Close() error {
+	s.closeConfirm()
 	s.access.Lock()
 	defer s.access.Unlock()
 	s.updateHooks = nil

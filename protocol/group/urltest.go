@@ -7,7 +7,6 @@ import (
 	"net"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -197,7 +196,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	s.group.confirmFailure(outbound, network)
 	return nil, err
 }
 
@@ -215,7 +214,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	s.group.confirmFailure(outbound, N.NetworkUDP)
 	return nil, err
 }
 
@@ -231,7 +230,8 @@ type URLTestGroup struct {
 	tolerance                    uint16
 	idleTimeout                  time.Duration
 	history                      *urltest.HistoryStorage
-	checking                     atomic.Bool
+	checkAccess                  sync.Mutex
+	checkRunning                 *groupCheck
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
 	interruptGroup               *interrupt.Group
@@ -242,6 +242,7 @@ type URLTestGroup struct {
 	close                        chan struct{}
 	started                      bool
 	lastActive                   common.TypedValue[time.Time]
+	unregisterConfirm            func()
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -283,6 +284,9 @@ func (g *URLTestGroup) PostStart() {
 	defer g.access.Unlock()
 	g.started = true
 	g.lastActive.Store(time.Now())
+	if g.unregisterConfirm == nil {
+		g.unregisterConfirm = g.history.RegisterGroup(g)
+	}
 	go g.CheckOutbounds(g.ctx, false)
 }
 
@@ -305,6 +309,10 @@ func (g *URLTestGroup) Touch() {
 func (g *URLTestGroup) Close() error {
 	g.access.Lock()
 	defer g.access.Unlock()
+	if g.unregisterConfirm != nil {
+		g.unregisterConfirm()
+		g.unregisterConfirm = nil
+	}
 	if g.ticker == nil {
 		return nil
 	}
@@ -394,13 +402,48 @@ func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return g.urlTest(ctx, true, 0)
 }
 
+// groupCheck is one run of a group check; callers arriving while it runs wait for
+// it (Open-Box tcp14).
+type groupCheck struct {
+	done     chan struct{}
+	result   map[string]uint16
+	complete bool
+}
+
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool, memberTimeout time.Duration) (map[string]uint16, error) {
-	if g.checking.Swap(true) {
-		return make(map[string]uint16), nil
+	for {
+		g.checkAccess.Lock()
+		running := g.checkRunning
+		if running == nil {
+			break
+		}
+		g.checkAccess.Unlock()
+		// Open-Box (tcp14): upstream answered a check requested while another one ran
+		// with an empty result, which a caller cannot tell from "every member failed"
+		// (the panel's scheduler then recorded all due members as timed out). Wait for
+		// the running check and answer with its results; it probed every member (or
+		// reused results within the interval, as this call would have). If that check
+		// was cut short (its request ended), run one ourselves.
+		select {
+		case <-running.done:
+		case <-ctx.Done():
+			return make(map[string]uint16), ctx.Err()
+		}
+		if running.complete {
+			return maps.Clone(running.result), nil
+		}
 	}
-	defer g.checking.Store(false)
+	check := &groupCheck{done: make(chan struct{})}
+	g.checkRunning = check
+	g.checkAccess.Unlock()
 	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force, memberTimeout)
 	g.performUpdateCheck()
+	g.checkAccess.Lock()
+	check.result = result
+	check.complete = ctx.Err() == nil
+	g.checkRunning = nil
+	close(check.done)
+	g.checkAccess.Unlock()
 	return result, nil
 }
 
@@ -485,6 +528,8 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 					// nothing to select (observed on a production router: six live members
 					// recorded as timed out in one second). A member that fails now really
 					// failed within its own timeout.
+					// Probe paces this against the kernel-wide budget (common/urltest/pacer.go)
+					// before calling here, so the member timeout starts once the slot is ours.
 					testCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.memberTimeout)
 					defer cancel()
 					return urltest.URLTest(testCtx, link, detour)
@@ -503,6 +548,39 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			})
 		}
 	}
+}
+
+// SelectedTags and Reselect register the group with the history storage, which
+// confirms a failure of a member in use before the group switches (Open-Box,
+// see common/urltest/confirm.go).
+func (g *URLTestGroup) SelectedTags() []string {
+	g.updateAccess.Lock()
+	tcp, udp := g.selectedOutboundTCP, g.selectedOutboundUDP
+	g.updateAccess.Unlock()
+	var tags []string
+	if tcp != nil {
+		tags = append(tags, RealTag(tcp, N.NetworkTCP))
+	}
+	if udp != nil && (tcp == nil || RealTag(udp, N.NetworkUDP) != RealTag(tcp, N.NetworkTCP)) {
+		tags = append(tags, RealTag(udp, N.NetworkUDP))
+	}
+	return tags
+}
+
+func (g *URLTestGroup) Reselect() {
+	g.performUpdateCheck()
+}
+
+// confirmFailure replaces upstream's "delete the history of the outbound a dial
+// just failed through": the member in use is probed again after the confirmation
+// delay and only dropped if it fails again.
+func (g *URLTestGroup) confirmFailure(outbound adapter.Outbound, network string) {
+	link := g.link
+	g.history.Failed(RealTag(outbound, network), link, func(ctx context.Context) (uint16, error) {
+		probeCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
+		defer cancel()
+		return urltest.URLTest(probeCtx, link, outbound)
+	})
 }
 
 func (g *URLTestGroup) performUpdateCheck() {
