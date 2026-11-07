@@ -22,20 +22,23 @@ import (
 )
 
 type HistoryStorage struct {
-	probeAccess  sync.Mutex
-	probes       map[probeKey]*probeEntry
-	access       sync.RWMutex
-	delayHistory map[string]*adapter.URLTestHistory
-	updateHooks  []*observable.Subscriber[struct{}]
-	confirmOnce  sync.Once
-	confirm      *confirmRegistry
-	pacerOnce    sync.Once
-	pacer        *probePacer
+	probeInstance string
+	probeRevision uint64
+	probeAccess   sync.Mutex
+	probes        map[probeKey]*probeEntry
+	access        sync.RWMutex
+	delayHistory  map[string]*adapter.URLTestHistory
+	updateHooks   []*observable.Subscriber[struct{}]
+	confirmOnce   sync.Once
+	confirm       *confirmRegistry
+	pacerOnce     sync.Once
+	pacer         *probePacer
 }
 
 func NewHistoryStorage() *HistoryStorage {
 	return &HistoryStorage{
-		delayHistory: make(map[string]*adapter.URLTestHistory),
+		probeInstance: newProbeInstance(),
+		delayHistory:  make(map[string]*adapter.URLTestHistory),
 	}
 }
 
@@ -63,6 +66,7 @@ func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory 
 func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
 	// Hot replacement/removal invalidates every condition and any old in-flight result.
 	s.probeAccess.Lock()
+	s.probeRevision++
 	for key := range s.probes {
 		if key.tag == tag {
 			delete(s.probes, key)
@@ -177,6 +181,7 @@ func urlTestMethod(ctx context.Context, link string, expected ExpectedStatus, de
 	if err != nil {
 		return
 	}
+	captureHTTPStatus(ctx, resp.StatusCode)
 	resp.Body.Close()
 	if method == http.MethodHead && (resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotImplemented) {
 		// Some sites only implement GET. Close HEAD's connection before retrying

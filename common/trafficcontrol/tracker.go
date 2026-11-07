@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -84,13 +85,30 @@ func (m *Manager) newTrackerMetadata(metadata adapter.InboundContext, matchedRul
 }
 
 type connTracker struct {
+	metadataAccess sync.RWMutex
 	N.ExtendedConn
 	metadata TrackerMetadata
 	manager  *Manager
 }
 
 func (t *connTracker) Metadata() *TrackerMetadata {
-	return &t.metadata
+	t.metadataAccess.RLock()
+	defer t.metadataAccess.RUnlock()
+	copy := t.metadata
+	return &copy
+}
+func (t *connTracker) SetOutboundChain(chain []adapter.Outbound) {
+	if len(chain) == 0 {
+		return
+	}
+	t.metadataAccess.Lock()
+	defer t.metadataAccess.Unlock()
+	t.metadata.Metadata.OutboundChain = append([]adapter.Outbound(nil), chain...)
+	t.metadata.Chain = common.Map(chain, adapter.Outbound.Tag)
+	slices.Reverse(t.metadata.Chain)
+	leaf := chain[len(chain)-1]
+	t.metadata.Outbound = leaf.Tag()
+	t.metadata.OutboundType = leaf.Type()
 }
 
 func (t *connTracker) Close() error {

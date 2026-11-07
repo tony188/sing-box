@@ -10,6 +10,7 @@ import (
 // ProbeResult keeps the original completion time when another consumer reuses
 // a result. A cache read must never manufacture a second history sample.
 type ProbeResult struct {
+	Status int
 	Time   time.Time
 	Delay  uint16
 	Err    error
@@ -63,10 +64,12 @@ func confirmingOf(ctx context.Context) bool {
 }
 
 type probeEntry struct {
-	done    chan struct{}
-	result  ProbeResult
-	history *adapter.URLTestHistory // last valid pass for this exact probe key
-	epoch   *byte                   // shared by successive probes until the outbound is invalidated
+	generation uint64
+	previous   ProbeResult
+	done       chan struct{}
+	result     ProbeResult
+	history    *adapter.URLTestHistory // last valid pass for this exact probe key
+	epoch      *byte                   // shared by successive probes until the outbound is invalidated
 	// ticket is the entry's place in the probe queue (pacer.go) while it waits for
 	// a slot; an interactive caller joining a queued background probe moves it up.
 	ticket *pacerTicket
@@ -115,23 +118,30 @@ func (s *HistoryStorage) Probe(ctx context.Context, tag, link string, interval t
 			}
 		}
 	}
-	if previous == nil { s.pruneProbesLocked() }
-	entry := &probeEntry{done: make(chan struct{}), epoch: new(byte)}
+	if previous == nil {
+		s.pruneProbesLocked()
+	}
+	entry := &probeEntry{done: make(chan struct{}), epoch: new(byte), generation: newProbeIdentity()}
 	if previous != nil {
-		entry.history, entry.epoch = previous.history, previous.epoch
+		entry.history, entry.epoch, entry.generation = previous.history, previous.epoch, previous.generation
+		entry.previous = previous.result
+		if entry.previous.Time.IsZero() {
+			entry.previous = previous.previous
+		}
 	}
 	s.probes[key] = entry
 	// Kernel-wide probe budget (pacer.go). The entry is registered first, so callers
 	// for the same member join it while it waits for a slot instead of queueing twice.
 	// run sets its own timeout (each caller's closure does), so waiting for the slot
 	// never eats into it.
-	ticket := s.probePacer().enqueue(PriorityOf(ctx))
+	ticket := s.probePacer().enqueueOwner(PriorityOf(ctx), link)
 	entry.ticket = ticket
 	s.probeAccess.Unlock()
 	s.probePacer().wait(ticket)
-	delay, err := run(ctx)
+	status := 0
+	delay, err := run(context.WithValue(ctx, httpStatusKey{}, &status))
 	s.probePacer().release(ticket)
-	result := ProbeResult{Time: time.Now(), Delay: delay, Err: err}
+	result := ProbeResult{Time: time.Now(), Delay: delay, Err: err, Status: status}
 	// Publish only if this outbound has not been invalidated during the probe.
 	// Retain the scoped pass on the first failure until its confirmation settles.
 	s.probeAccess.Lock()

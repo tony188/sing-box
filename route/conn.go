@@ -101,6 +101,8 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = adapter.WithContext(ctx, &metadata)
+	this = urlTestFallbackDialer(this, metadata.OutboundChain)
+ if fallback, ok := this.(*fallbackDialer); ok { ctx = fallback.fallbackContext(ctx) }
 	var (
 		remoteConn net.Conn
 		err        error
@@ -122,12 +124,18 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 			dialerString = " using outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
 		}
 		err = E.Cause(err, "open connection to ", remoteString, dialerString)
-		m.deleteURLTestHistory(metadata.OutboundChain)
+		if ctx.Err() == nil {
+			m.confirmURLTestFailure(metadata.OutboundChain, N.NetworkTCP)
+		}
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		m.logger.ErrorContext(ctx, err)
 		return
 	}
-	err = N.ReportConnHandshakeSuccess(conn, remoteConn)
+	if tracker, ok := common.Cast[interface{ SetOutboundChain([]adapter.Outbound) }](conn); ok {
+		tracker.SetOutboundChain(metadata.OutboundChain)
+	}
+	if hasURLTestFallback(metadata.OutboundChain) { onClose = registerInterrupt(metadata.OutboundChain, conn, onClose) }
+ err = N.ReportConnHandshakeSuccess(conn, remoteConn)
 	if err != nil {
 		err = E.Cause(err, "report handshake success")
 		remoteConn.Close()
@@ -198,7 +206,9 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 				dialerString = " using outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
 			}
 			err = E.Cause(err, "open packet connection to ", remoteString, dialerString)
-			m.deleteURLTestHistory(metadata.OutboundChain)
+			if ctx.Err() == nil {
+				m.confirmURLTestFailure(metadata.OutboundChain, N.NetworkUDP)
+			}
 			N.CloseOnHandshakeFailure(conn, onClose, err)
 			m.logger.ErrorContext(ctx, err)
 			return
@@ -222,7 +232,9 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 				dialerString = " using outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
 			}
 			err = E.Cause(err, "listen packet connection using ", dialerString)
-			m.deleteURLTestHistory(metadata.OutboundChain)
+			if ctx.Err() == nil {
+				m.confirmURLTestFailure(metadata.OutboundChain, N.NetworkUDP)
+			}
 			N.CloseOnHandshakeFailure(conn, onClose, err)
 			m.logger.ErrorContext(ctx, err)
 			return
@@ -281,12 +293,22 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
 }
 
-func (m *ConnectionManager) deleteURLTestHistory(chain []adapter.Outbound) {
-	if slices.ContainsFunc(chain, func(it adapter.Outbound) bool {
-		_, isURLTestGroup := it.(adapter.URLTestGroup)
-		return isURLTestGroup
-	}) {
-		m.urlTestHistory.DeleteURLTestHistory(chain[len(chain)-1].Tag())
+func (m *ConnectionManager) confirmURLTestFailure(chain []adapter.Outbound, network string) {
+	if len(chain) == 0 {
+		return
+	}
+	leaf := chain[len(chain)-1]
+	handled := false
+	for _, outbound := range chain {
+		if group, ok := outbound.(interface {
+			ConfirmFailure(adapter.Outbound, string)
+		}); ok {
+			group.ConfirmFailure(leaf, network)
+			handled = true
+		}
+	}
+	if !handled && slices.ContainsFunc(chain, func(o adapter.Outbound) bool { _, ok := o.(adapter.URLTestGroup); return ok }) {
+		m.urlTestHistory.DeleteURLTestHistory(leaf.Tag())
 	}
 }
 

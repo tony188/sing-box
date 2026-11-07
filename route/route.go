@@ -165,9 +165,9 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
-	onClose = registerInterrupt(chain, conn, onClose)
+	if !hasURLTestFallback(chain) { onClose = registerInterrupt(chain, conn, onClose) }
 	outbound := chain[len(chain)-1]
-	if outboundHandler, isHandler := outbound.(adapter.ConnectionHandler); isHandler {
+	if outboundHandler, isHandler := outbound.(adapter.ConnectionHandler); isHandler && !hasURLTestFallback(chain) {
 		outboundHandler.NewConnection(ctx, conn, metadata, onClose)
 	} else {
 		r.connection.NewConnection(ctx, outbound, conn, metadata, onClose)

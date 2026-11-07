@@ -80,6 +80,7 @@ func PriorityOf(ctx context.Context) ProbePriority {
 type pacerTicket struct {
 	grant    chan time.Time
 	priority ProbePriority
+	owner    string
 	queued   bool
 	// background: the ticket holds one of the background slots (fixed at start)
 	background bool
@@ -92,8 +93,10 @@ type probePacer struct {
 	running           int
 	runningBackground int
 	next              time.Time
+	interactiveBurst  int
 	// queues[priority], served from critical down to background
-	queues [3][]*pacerTicket
+	queues    [3][]*pacerTicket
+	lastOwner [3]string
 }
 
 func (s *HistoryStorage) probePacer() *probePacer {
@@ -133,6 +136,13 @@ func (p *probePacer) reserveStartLocked() time.Time {
 
 func (p *probePacer) startLocked(ticket *pacerTicket) {
 	p.running++
+	p.lastOwner[ticket.priority] = ticket.owner
+	if ticket.priority == PriorityInteractive {
+		p.interactiveBurst++
+	}
+	if ticket.priority == PriorityBackground {
+		p.interactiveBurst = 0
+	}
 	ticket.background = ticket.priority == PriorityBackground
 	if ticket.background {
 		p.runningBackground++
@@ -142,13 +152,49 @@ func (p *probePacer) startLocked(ticket *pacerTicket) {
 }
 
 // dispatchLocked starts queued tickets while there is room, highest priority first.
-func (p *probePacer) dispatchLocked() {
-	for priority := PriorityCritical; priority >= PriorityBackground; priority-- {
-		for len(p.queues[priority]) > 0 && p.canStartLocked(priority) {
-			ticket := p.queues[priority][0]
-			p.queues[priority] = p.queues[priority][1:]
-			p.startLocked(ticket)
+func (p *probePacer) popLocked(priority ProbePriority) *pacerTicket {
+	q := p.queues[priority]
+	if len(q) == 0 {
+		return nil
+	}
+	owners := []string{}
+	seen := map[string]bool{}
+	for _, t := range q {
+		if !seen[t.owner] {
+			seen[t.owner] = true
+			owners = append(owners, t.owner)
 		}
+	}
+	owner := owners[0]
+	for i, name := range owners {
+		if name == p.lastOwner[priority] {
+			owner = owners[(i+1)%len(owners)]
+			break
+		}
+	}
+	for i, t := range q {
+		if t.owner == owner {
+			p.queues[priority] = append(q[:i:i], q[i+1:]...)
+			p.lastOwner[priority] = owner
+			return t
+		}
+	}
+	return nil
+}
+
+func (p *probePacer) dispatchLocked() {
+	for p.running < p.limit {
+		priority := PriorityBackground
+		if len(p.queues[PriorityCritical]) > 0 {
+			priority = PriorityCritical
+		} else if len(p.queues[PriorityBackground]) > 0 && p.runningBackground == 0 && p.interactiveBurst >= max(2, p.limit) {
+			priority = PriorityBackground
+		} else if len(p.queues[PriorityInteractive]) > 0 {
+			priority = PriorityInteractive
+		} else if len(p.queues[PriorityBackground]) == 0 || !p.canStartLocked(PriorityBackground) {
+			break
+		}
+		p.startLocked(p.popLocked(priority))
 	}
 }
 
@@ -156,7 +202,10 @@ func (p *probePacer) dispatchLocked() {
 // higher priority is waiting, otherwise queues a ticket; either way the caller
 // then waits on the ticket's grant.
 func (p *probePacer) enqueue(priority ProbePriority) *pacerTicket {
-	ticket := &pacerTicket{grant: make(chan time.Time, 1), priority: priority}
+	return p.enqueueOwner(priority, "")
+}
+func (p *probePacer) enqueueOwner(priority ProbePriority, owner string) *pacerTicket {
+	ticket := &pacerTicket{grant: make(chan time.Time, 1), priority: priority, owner: owner}
 	p.access.Lock()
 	defer p.access.Unlock()
 	waitingAhead := false

@@ -196,12 +196,17 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
 	}
+	if N.NetworkName(network) == N.NetworkTCP && ctx.Value(dialFallbackKey{}) == nil {
+		return s.dialTCPWithFallback(ctx, network, destination, outbound)
+	}
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.confirmFailure(outbound, network)
+	if ctx.Err() == nil {
+		s.group.confirmFailure(outbound, network)
+	}
 	return nil, err
 }
 
@@ -543,7 +548,9 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, expected 
 
 func (b *urlTestBatch) probe(detour adapter.Outbound, link string, expected urltest.ExpectedStatus, interval time.Duration, force bool) {
 	tag := RealTag(detour, N.NetworkTCP)
-	if leaf, loaded := b.outbound.Outbound(tag); loaded { detour = leaf }
+	if leaf, loaded := b.outbound.Outbound(tag); loaded {
+		detour = leaf
+	}
 	result := b.history.Probe(b.ctx, tag, urltest.ProbeLink(link, expected), interval, force, func(ctx context.Context) (uint16, error) {
 		// Each member gets its own timeout, detached from the request's deadline:
 		// with ten members probed at a time a group with many dead members outlives
@@ -602,7 +609,11 @@ func (g *URLTestGroup) confirmFailure(outbound adapter.Outbound, network string)
 	link, expected := g.link, g.expected
 	tag := RealTag(outbound, network)
 	// A nested group may select another leaf during the ten-second delay.
+	if frozen, ok := outbound.(*frozenDialOutbound); ok { outbound = frozen.Outbound }
 	if leaf, loaded := g.outbound.Outbound(tag); loaded {
+        // A late failure from an old in-flight dial must not confirm the new
+        // outbound created under the same tag by a hot replacement.
+        if _, nested := outbound.(adapter.OutboundGroup); !nested && leaf != outbound { return }
 		outbound = leaf
 	}
 	g.history.Failed(tag, urltest.ProbeLink(link, expected), func(ctx context.Context) (uint16, error) {

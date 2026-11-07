@@ -36,6 +36,7 @@ type confirmRegistry struct {
 	groups     map[uint64]ConfirmGroup
 	nextID     uint64
 	confirming map[probeKey]chan struct{}
+	events     map[probeKey]Confirmation
 	done       chan struct{}
 }
 
@@ -44,6 +45,7 @@ func (s *HistoryStorage) confirmState() *confirmRegistry {
 		s.confirm = &confirmRegistry{
 			groups:     make(map[uint64]ConfirmGroup),
 			confirming: make(map[probeKey]chan struct{}),
+			events:     make(map[probeKey]Confirmation),
 			done:       make(chan struct{}),
 		}
 	})
@@ -130,7 +132,7 @@ func (s *HistoryStorage) failed(tag, link string, probe func(ctx context.Context
 	if history != nil && history.Time.After(failedAt) {
 		return false
 	}
-	if probe == nil || history == nil || !s.inUse(tag, link) {
+	if probe == nil || !s.inUse(tag, link) {
 		s.deleteProbeHistory(tag, link, failedAt)
 		return false
 	}
@@ -138,8 +140,13 @@ func (s *HistoryStorage) failed(tag, link string, probe func(ctx context.Context
 	s.probeAccess.Lock()
 	entry := s.probes[probeKey{tag, link}]
 	if entry == nil {
-		s.probeAccess.Unlock()
-		return false
+ s.pruneProbesLocked()
+		if s.probes == nil {
+			s.probes = make(map[probeKey]*probeEntry)
+		}
+		entry = &probeEntry{done: make(chan struct{}), epoch: new(byte), generation: newProbeIdentity()}
+		close(entry.done)
+		s.probes[probeKey{tag, link}] = entry
 	}
 	epoch := entry.epoch
 	r := s.confirmState()
@@ -152,6 +159,7 @@ func (s *HistoryStorage) failed(tag, link string, probe func(ctx context.Context
 	}
 	cancel := make(chan struct{})
 	r.confirming[key] = cancel
+	r.events[key] = Confirmation{FailedAt: failedAt.UnixMilli(), DueAt: time.Now().Add(ConfirmDelay).UnixMilli(), Stage: "waiting"}
 	done := r.done
 	r.access.Unlock()
 	delay := ConfirmDelay
@@ -175,7 +183,12 @@ func (s *HistoryStorage) failed(tag, link string, probe func(ctx context.Context
 		// probe (the failed caller's run function) sets its own timeout.
 		ctx := withConfirming(WithNewerThan(WithPriority(context.Background(), PriorityCritical), failedAt))
 		ctx = context.WithValue(ctx, probeEpochKey{}, epoch)
-		result := s.Probe(ctx, tag, link, 0, true, probe)
+		s.markConfirmation(key, cancel, "queued")
+		before := s.selectedFor(link)
+		result := s.Probe(ctx, tag, link, 0, true, func(ctx context.Context) (uint16, error) {
+			s.markConfirmation(key, cancel, "probing")
+			return probe(ctx)
+		})
 		select {
 		case <-done:
 			return
@@ -188,6 +201,7 @@ func (s *HistoryStorage) failed(tag, link string, probe func(ctx context.Context
 			s.deleteProbeHistory(tag, link, failedAt)
 		}
 		s.reselectAll()
+		s.finishConfirmation(key, cancel, result, before, s.selectedFor(link))
 	}()
 	return true
 }
