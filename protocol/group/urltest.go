@@ -519,7 +519,7 @@ type urlTestBatch struct {
 // groups test with their own link and expectation.
 func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, expected urltest.ExpectedStatus, interval time.Duration, force bool, memberTimeout time.Duration) map[string]uint16 {
 	if memberTimeout <= 0 {
-		memberTimeout = C.TCPTimeout
+		memberTimeout = urltest.BackgroundProbeTimeout
 	}
 	testBatch := &urlTestBatch{
 		ctx:           ctx,
@@ -673,7 +673,7 @@ func (g *URLTestGroup) confirmFailure(outbound adapter.Outbound, network string)
 		outbound = leaf
 	}
 	g.history.Failed(tag, urltest.ProbeLink(link, expected), func(ctx context.Context) (uint16, error) {
-		probeCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
+		probeCtx, cancel := context.WithTimeout(ctx, urltest.BackgroundProbeTimeout)
 		defer cancel()
 		return urltest.URLTestExpected(probeCtx, link, expected, outbound)
 	})
