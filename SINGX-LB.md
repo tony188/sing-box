@@ -35,19 +35,23 @@ Open-Box code.
   -ldflags "-X github.com/sagernet/sing-box/constant.Version=1.14.4
   -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w -buildid="
   ./experimental/libbox`
-  with `GOFLAGS=-trimpath` — the bind MUST use `-trimpath`: without it the
-  absolute build directory is embedded in the `.so` (572 occurrences), so
-  the same tree built from a different directory produces a different AAR
-  sha. The first G1b build (without `-trimpath`) produced sha
-  `8a2de809…107b`, which is path-specific and superseded.
+  with `GOFLAGS="-trimpath -buildvcs=false"` — the bind MUST use BOTH
+  flags: `-trimpath` (without it the absolute build directory is embedded
+  in the `.so`, 572 occurrences, so the same tree built from a different
+  directory produces a different AAR sha) and `-buildvcs=false` (without
+  it Go VCS stamping embeds the build-time git state, so an AAR built from
+  an uncommitted tree can never be reproduced from a committed branch).
+  The first G1b build (no `-trimpath`) produced sha `8a2de809…107b`
+  (path-specific, superseded); the `-trimpath`-only build produced
+  `a39e764a…522ba` (commit-specific via VCS stamping, superseded).
 - `go/*` (gomobile Seq runtime) stripped from `classes.jar` — it is provided
   once by the separate `go-seq.jar`, as in the SingX tree.
 
 Result (verified, reproduced byte-identically from two different build
-directories):
+directories AND from committed vs uncommitted trees):
 
-- `libbox-lb.aar`: 39,916,574 bytes
-- sha256: `a39e764a48b05506b4db6fc3e2236e3186b0838bad85ee4fb5ba04edda8522ba`
+- `libbox-lb.aar`: 39,915,113 bytes
+- sha256: `8f75be61290c396b4ffee7a3debddacdf35d721d121c6cb66decb4fc8c1b1da6`
 
 Checks run on this branch before the AAR build: `go vet`, `go test`
 (`TestOpenBoxLoadBalance`, `TestOpenBoxURLTestWorkers`,
