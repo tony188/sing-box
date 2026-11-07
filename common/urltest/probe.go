@@ -115,6 +115,7 @@ func (s *HistoryStorage) Probe(ctx context.Context, tag, link string, interval t
 			}
 		}
 	}
+	if previous == nil { s.pruneProbesLocked() }
 	entry := &probeEntry{done: make(chan struct{}), epoch: new(byte)}
 	if previous != nil {
 		entry.history, entry.epoch = previous.history, previous.epoch
