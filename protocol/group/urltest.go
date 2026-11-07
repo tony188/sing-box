@@ -17,7 +17,6 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/batch"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -465,7 +464,7 @@ type urlTestBatch struct {
 	outbound      adapter.OutboundManager
 	history       *urltest.HistoryStorage
 	logger        log.Logger
-	batch         *batch.Batch[any]
+	tasks         []func()
 	checked       map[string]bool
 	groups        []adapter.OutboundGroup
 	access        sync.Mutex
@@ -481,19 +480,21 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 	if memberTimeout <= 0 {
 		memberTimeout = C.TCPTimeout
 	}
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	testBatch := &urlTestBatch{
 		ctx:           ctx,
 		outbound:      outboundManager,
 		history:       history,
 		logger:        logger,
-		batch:         b,
 		checked:       make(map[string]bool),
 		result:        make(map[string]uint16),
 		memberTimeout: memberTimeout,
 	}
 	testBatch.test(outbounds, link, expected, interval, force)
-	b.Wait()
+	// Open-Box (tcp20): ten workers take the queued checks in turn instead of one goroutine
+	// per member parked on a slot (openbox_workers.go); same ten at a time as upstream.
+	workers := 10
+	if common.LowMemory { workers = 4 }
+	runBounded(workers, testBatch.tasks)
 	for _, outboundGroup := range testBatch.groups {
 		groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
 		if groupHistory != nil {
@@ -513,12 +514,11 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, expected 
 		case *URLTest:
 			b.checked[tag] = true
 			b.groups = append(b.groups, nested)
-			b.batch.Go(tag, func() (any, error) {
+			b.tasks = append(b.tasks, func() {
 				nestedResult, _ := nested.group.urlTest(b.ctx, force, b.memberTimeout)
 				b.access.Lock()
 				maps.Copy(b.result, nestedResult)
 				b.access.Unlock()
-				return nil, nil
 			})
 		case adapter.OutboundGroup:
 			b.checked[tag] = true
@@ -529,7 +529,7 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, expected 
 			})), link, expected, interval, force)
 		default:
 			b.checked[tag] = true
-			b.batch.Go(tag, func() (any, error) {
+			b.tasks = append(b.tasks, func() {
 				result := b.history.Probe(b.ctx, tag, urltest.ProbeLink(link, expected), interval, force, func(ctx context.Context) (uint16, error) {
 					// Each member gets its own timeout, detached from the request's deadline:
 					// with ten members probed at a time a group with many dead members outlives
@@ -554,7 +554,6 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, expected 
 					b.result[tag] = result.Delay
 					b.access.Unlock()
 				}
-				return nil, nil
 			})
 		}
 	}
