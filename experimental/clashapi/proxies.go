@@ -62,6 +62,8 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	var info badjson.JSONObject
 	var clashType string
 	switch detour.Type() {
+	case group.LoadBalanceType:
+		clashType = "LoadBalance"
 	case C.TypeBlock:
 		clashType = "Reject"
 	default:
@@ -83,6 +85,11 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 		}
 		info.Put("now", now)
 		info.Put("all", group.All())
+	}
+	if balance, ok := detour.(*group.LoadBalance); ok {
+		info.Put("all", balance.All())
+		info.Put("now", "")
+		info.Put("loadBalance", balance.Status())
 	}
 	return &info
 }

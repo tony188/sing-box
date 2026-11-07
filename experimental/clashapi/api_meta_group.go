@@ -30,7 +30,7 @@ func groupRouter(server *Server) http.Handler {
 func getGroups(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		groups := common.Map(common.Filter(server.outbound.Outbounds(), func(it adapter.Outbound) bool {
-			_, isGroup := it.(adapter.OutboundGroup)
+			_, isGroup := it.(interface { All() []string })
 			return isGroup
 		}), func(it adapter.Outbound) *badjson.JSONObject {
 			return proxyInfo(server, it)
@@ -44,7 +44,7 @@ func getGroups(server *Server) func(w http.ResponseWriter, r *http.Request) {
 func getGroup(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
-		if _, ok := proxy.(adapter.OutboundGroup); ok {
+		if _, ok := proxy.(interface { All() []string }); ok {
 			render.JSON(w, r, proxyInfo(server, proxy))
 			return
 		}
@@ -56,7 +56,7 @@ func getGroup(server *Server) func(w http.ResponseWriter, r *http.Request) {
 func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
-		outboundGroup, ok := proxy.(adapter.OutboundGroup)
+		outboundGroup, ok := proxy.(interface { All() []string })
 		if !ok {
 			render.Status(r, http.StatusNotFound)
 			render.JSON(w, r, ErrNotFound)
