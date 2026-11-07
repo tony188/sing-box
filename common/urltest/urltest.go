@@ -21,6 +21,8 @@ import (
 )
 
 type HistoryStorage struct {
+	probeAccess  sync.Mutex
+	probes       map[probeKey]*probeEntry
 	access       sync.RWMutex
 	delayHistory map[string]*adapter.URLTestHistory
 	updateHooks  []*observable.Subscriber[struct{}]
@@ -97,7 +99,7 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) 
 
 func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err error) {
 	if link == "" {
-		link = "https://www.gstatic.com/generate_204"
+		link = "http://www.gstatic.com/generate_204"
 	}
 	linkURL, err := url.Parse(link)
 	if err != nil {
@@ -148,6 +150,8 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		return
 	}
 	resp.Body.Close()
-	t = uint16(time.Since(start) / time.Millisecond)
+	// A successful sub-millisecond HTTP probe must not look unavailable to
+	// Clash API clients, which reserve zero for failed tests.
+	t = uint16(max(1, time.Since(start)/time.Millisecond))
 	return
 }

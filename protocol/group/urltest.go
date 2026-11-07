@@ -140,6 +140,15 @@ func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return s.group.URLTest(ctx)
 }
 
+// URLTestWithForce lets the panel scheduler request a group check while still
+// honoring sing-box's per-node interval cache. The regular URLTest API remains
+// a forced check for interactive/manual requests. memberTimeout bounds each
+// member's own probe (0 keeps C.TCPTimeout); it is the panel's latency test
+// timeout, so a dead member costs what the user configured, not 15 seconds.
+func (s *URLTest) URLTestWithForce(ctx context.Context, force bool, memberTimeout time.Duration) (map[string]uint16, error) {
+	return s.group.urlTest(ctx, force, memberTimeout)
+}
+
 func (s *URLTest) CheckOutbounds() {
 	s.group.CheckOutbounds(s.ctx, true)
 }
@@ -378,19 +387,19 @@ func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{})
 }
 
 func (g *URLTestGroup) CheckOutbounds(ctx context.Context, force bool) {
-	_, _ = g.urlTest(ctx, force)
+	_, _ = g.urlTest(ctx, force, 0)
 }
 
 func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
-	return g.urlTest(ctx, true)
+	return g.urlTest(ctx, true, 0)
 }
 
-func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
+func (g *URLTestGroup) urlTest(ctx context.Context, force bool, memberTimeout time.Duration) (map[string]uint16, error) {
 	if g.checking.Swap(true) {
 		return make(map[string]uint16), nil
 	}
 	defer g.checking.Store(false)
-	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force)
+	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force, memberTimeout)
 	g.performUpdateCheck()
 	return result, nil
 }
@@ -401,27 +410,34 @@ type urlTestResult struct {
 }
 
 type urlTestBatch struct {
-	ctx      context.Context
-	outbound adapter.OutboundManager
-	history  *urltest.HistoryStorage
-	logger   log.Logger
-	batch    *batch.Batch[any]
-	checked  map[string]bool
-	groups   []adapter.OutboundGroup
-	access   sync.Mutex
-	result   map[string]uint16
+	ctx           context.Context
+	outbound      adapter.OutboundManager
+	history       *urltest.HistoryStorage
+	logger        log.Logger
+	batch         *batch.Batch[any]
+	checked       map[string]bool
+	groups        []adapter.OutboundGroup
+	access        sync.Mutex
+	result        map[string]uint16
+	memberTimeout time.Duration
 }
 
-func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
+// memberTimeout bounds each member's own probe; 0 means C.TCPTimeout (the kernel's
+// own background checks). The Clash API passes the panel's latency test timeout.
+func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, memberTimeout time.Duration) map[string]uint16 {
+	if memberTimeout <= 0 {
+		memberTimeout = C.TCPTimeout
+	}
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	testBatch := &urlTestBatch{
-		ctx:      ctx,
-		outbound: outboundManager,
-		history:  history,
-		logger:   logger,
-		batch:    b,
-		checked:  make(map[string]bool),
-		result:   make(map[string]uint16),
+		ctx:           ctx,
+		outbound:      outboundManager,
+		history:       history,
+		logger:        logger,
+		batch:         b,
+		checked:       make(map[string]bool),
+		result:        make(map[string]uint16),
+		memberTimeout: memberTimeout,
 	}
 	testBatch.test(outbounds, link, interval, force)
 	b.Wait()
@@ -445,7 +461,7 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.checked[tag] = true
 			b.groups = append(b.groups, nested)
 			b.batch.Go(tag, func() (any, error) {
-				nestedResult, _ := nested.group.urlTest(b.ctx, force)
+				nestedResult, _ := nested.group.urlTest(b.ctx, force, b.memberTimeout)
 				b.access.Lock()
 				maps.Copy(b.result, nestedResult)
 				b.access.Unlock()
@@ -459,39 +475,28 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				return member
 			})), link, interval, force)
 		default:
-			history := b.history.LoadURLTestHistory(tag)
-			if !force && history != nil && time.Since(history.Time) < interval {
-				continue
-			}
 			b.checked[tag] = true
 			b.batch.Go(tag, func() (any, error) {
-				testCtx, cancel := context.WithTimeout(b.ctx, C.TCPTimeout)
-				defer cancel()
-				testChan := make(chan urlTestResult, 1)
-				go func() {
-					delay, testErr := urltest.URLTest(testCtx, link, detour)
-					testChan <- urlTestResult{delay, testErr}
-				}()
-				var testResult urlTestResult
-				select {
-				case testResult = <-testChan:
-				case <-testCtx.Done():
-					testResult.err = testCtx.Err()
-				}
-				if testResult.err != nil {
-					if b.ctx.Err() != nil {
-						return nil, nil
-					}
-					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
-					b.history.DeleteURLTestHistory(tag)
+				result := b.history.Probe(b.ctx, tag, link, interval, force, func(ctx context.Context) (uint16, error) {
+					// Each member gets its own timeout, detached from the request's deadline:
+					// with ten members probed at a time a group with many dead members outlives
+					// any single request bound. Deriving from the request context made every
+					// member still pending fail at once and lose its history, leaving the group
+					// nothing to select (observed on a production router: six live members
+					// recorded as timed out in one second). A member that fails now really
+					// failed within its own timeout.
+					testCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.memberTimeout)
+					defer cancel()
+					return urltest.URLTest(testCtx, link, detour)
+				})
+				if result.Err != nil {
+					b.logger.Debug("outbound ", tag, " unavailable: ", result.Err)
 				} else {
-					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
-					b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
-						Time:  time.Now(),
-						Delay: testResult.delay,
-					})
+					if !result.Reused {
+						b.logger.Debug("outbound ", tag, " available: ", result.Delay, "ms")
+					}
 					b.access.Lock()
-					b.result[tag] = testResult.delay
+					b.result[tag] = result.Delay
 					b.access.Unlock()
 				}
 				return nil, nil

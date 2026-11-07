@@ -2,10 +2,10 @@ package clashapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -216,9 +216,6 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
 		url := query.Get("url")
-		if strings.HasPrefix(url, "http://") {
-			url = ""
-		}
 		timeout, err := strconv.ParseInt(query.Get("timeout"), 10, 16)
 		if err != nil {
 			render.Status(r, http.StatusBadRequest)
@@ -226,21 +223,37 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
+		force := true
+		if value := query.Get("force"); value != "" {
+			force, err = strconv.ParseBool(value)
+			if err != nil {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, ErrBadRequest)
+				return
+			}
+		}
+		interval := int64(0)
+		if !force {
+			interval, err = strconv.ParseInt(query.Get("interval"), 10, 64)
+			if err != nil || interval <= 0 || interval > 86400000 {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, ErrBadRequest)
+				return
+			}
+		}
 		proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
+		realTag := group.RealTag(proxy, N.NetworkTCP)
+		// Freeze the chosen leaf for the duration of this probe.
+		if leaf, loaded := server.outbound.Outbound(realTag); loaded {
+			proxy = leaf
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeout))
 		defer cancel()
-
-		delay, err := urltest.URLTest(ctx, url, proxy)
+		result := server.urlTestHistory.Probe(ctx, realTag, url, time.Millisecond*time.Duration(interval), force, func(ctx context.Context) (uint16, error) {
+			return urltest.URLTest(ctx, url, proxy)
+		})
+		delay, err := result.Delay, result.Err
 		defer func() {
-			realTag := group.RealTag(proxy, N.NetworkTCP)
-			if err != nil {
-				server.urlTestHistory.DeleteURLTestHistory(realTag)
-			} else {
-				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
-					Time:  time.Now(),
-					Delay: delay,
-				})
-			}
 			for _, detour := range server.outbound.Outbounds() {
 				urlTestGroup, isURLTestGroup := detour.(adapter.URLTestGroup)
 				if !isURLTestGroup {
@@ -253,20 +266,22 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			}
 		}()
 
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
 			render.Status(r, http.StatusGatewayTimeout)
-			render.JSON(w, r, ErrRequestTimeout)
+			render.JSON(w, r, render.M{"message": "Timeout", "time": result.Time, "reused": result.Reused})
 			return
 		}
 
 		if err != nil || delay == 0 {
 			render.Status(r, http.StatusServiceUnavailable)
-			render.JSON(w, r, newError("An error occurred in the delay test"))
+			render.JSON(w, r, render.M{"message": "An error occurred in the delay test", "time": result.Time, "reused": result.Reused})
 			return
 		}
 
 		render.JSON(w, r, render.M{
-			"delay": delay,
+			"delay":  delay,
+			"time":   result.Time,
+			"reused": result.Reused,
 		})
 	}
 }
