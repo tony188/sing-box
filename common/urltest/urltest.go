@@ -61,10 +61,19 @@ func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory 
 }
 
 func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
+	// Hot replacement/removal invalidates every condition and any old in-flight result.
+	s.probeAccess.Lock()
+	for key := range s.probes {
+		if key.tag == tag {
+			delete(s.probes, key)
+		}
+	}
+	s.cancelConfirm(tag)
 	s.access.Lock()
 	delete(s.delayHistory, tag)
 	s.notifyUpdated()
 	s.access.Unlock()
+	s.probeAccess.Unlock()
 }
 
 func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTestHistory) {

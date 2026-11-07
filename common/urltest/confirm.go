@@ -27,6 +27,7 @@ var ConfirmDelay = 10 * time.Second
 // uses right now, and how to make it select again once a confirmation settled.
 type ConfirmGroup interface {
 	SelectedTags() []string
+	ProbeLink() string
 	Reselect()
 }
 
@@ -34,7 +35,7 @@ type confirmRegistry struct {
 	access     sync.Mutex
 	groups     map[uint64]ConfirmGroup
 	nextID     uint64
-	confirming map[string]bool
+	confirming map[probeKey]chan struct{}
 	done       chan struct{}
 }
 
@@ -42,7 +43,7 @@ func (s *HistoryStorage) confirmState() *confirmRegistry {
 	s.confirmOnce.Do(func() {
 		s.confirm = &confirmRegistry{
 			groups:     make(map[uint64]ConfirmGroup),
-			confirming: make(map[string]bool),
+			confirming: make(map[probeKey]chan struct{}),
 			done:       make(chan struct{}),
 		}
 	})
@@ -68,7 +69,7 @@ func (s *HistoryStorage) RegisterGroup(group ConfirmGroup) func() {
 	}
 }
 
-func (s *HistoryStorage) inUse(tag string) bool {
+func (s *HistoryStorage) inUse(tag, link string) bool {
 	r := s.confirmState()
 	r.access.Lock()
 	groups := make([]ConfirmGroup, 0, len(r.groups))
@@ -77,6 +78,9 @@ func (s *HistoryStorage) inUse(tag string) bool {
 	}
 	r.access.Unlock()
 	for _, group := range groups {
+		if probeLinkDefault(group.ProbeLink()) != link {
+			continue
+		}
 		for _, selected := range group.SelectedTags() {
 			if selected == tag {
 				return true
@@ -114,28 +118,49 @@ func (s *HistoryStorage) reselectAll() {
 // member is not probed a second time. A recheck is critical: first in the probe
 // queue, inside the same budget.
 func (s *HistoryStorage) Failed(tag, link string, probe func(ctx context.Context) (uint16, error)) bool {
+	return s.failed(tag, link, probe, time.Now())
+}
+
+func (s *HistoryStorage) failed(tag, link string, probe func(ctx context.Context) (uint16, error), failedAt time.Time) bool {
 	if s == nil {
 		return false
 	}
-	if probe == nil || s.LoadURLTestHistory(tag) == nil || !s.inUse(tag) {
-		s.DeleteURLTestHistory(tag)
+	link = probeLinkDefault(link)
+	history := s.LoadProbeHistory(tag, link)
+	if history != nil && history.Time.After(failedAt) {
 		return false
 	}
+	if probe == nil || history == nil || !s.inUse(tag, link) {
+		s.deleteProbeHistory(tag, link, failedAt)
+		return false
+	}
+	// Keep lock order consistent with outbound invalidation: probe -> confirmation.
+	s.probeAccess.Lock()
+	entry := s.probes[probeKey{tag, link}]
+	if entry == nil {
+		s.probeAccess.Unlock()
+		return false
+	}
+	epoch := entry.epoch
 	r := s.confirmState()
 	r.access.Lock()
-	if r.confirming[tag] {
+	s.probeAccess.Unlock()
+	key := probeKey{tag, link}
+	if r.confirming[key] != nil {
 		r.access.Unlock()
 		return true
 	}
-	r.confirming[tag] = true
+	cancel := make(chan struct{})
+	r.confirming[key] = cancel
 	done := r.done
 	r.access.Unlock()
-	failedAt := time.Now()
 	delay := ConfirmDelay
 	go func() {
 		defer func() {
 			r.access.Lock()
-			delete(r.confirming, tag)
+			if r.confirming[key] == cancel {
+				delete(r.confirming, key)
+			}
 			r.access.Unlock()
 		}()
 		timer := time.NewTimer(delay)
@@ -143,22 +168,24 @@ func (s *HistoryStorage) Failed(tag, link string, probe func(ctx context.Context
 		select {
 		case <-done:
 			return
+		case <-cancel:
+			return
 		case <-timer.C:
 		}
 		// probe (the failed caller's run function) sets its own timeout.
 		ctx := withConfirming(WithNewerThan(WithPriority(context.Background(), PriorityCritical), failedAt))
+		ctx = context.WithValue(ctx, probeEpochKey{}, epoch)
 		result := s.Probe(ctx, tag, link, 0, true, probe)
 		select {
 		case <-done:
 			return
+		case <-cancel:
+			return
 		default:
 		}
 		if result.Err != nil || result.Delay == 0 {
-			// A pass recorded after the failure through another link or group wins;
-			// otherwise the member really is down twice in a row.
-			if current := s.LoadURLTestHistory(tag); current == nil || !current.Time.After(failedAt) {
-				s.DeleteURLTestHistory(tag)
-			}
+			// Only a newer pass for this same URL/status condition can save it.
+			s.deleteProbeHistory(tag, link, failedAt)
 		}
 		s.reselectAll()
 	}()
@@ -166,14 +193,14 @@ func (s *HistoryStorage) Failed(tag, link string, probe func(ctx context.Context
 }
 
 // Confirming reports whether tag has a confirmation pending (tests and the Clash API).
-func (s *HistoryStorage) Confirming(tag string) bool {
+func (s *HistoryStorage) Confirming(tag, link string) bool {
 	if s == nil {
 		return false
 	}
 	r := s.confirmState()
 	r.access.Lock()
 	defer r.access.Unlock()
-	return r.confirming[tag]
+	return r.confirming[probeKey{tag, probeLinkDefault(link)}] != nil
 }
 
 func (s *HistoryStorage) closeConfirm() {

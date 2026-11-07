@@ -740,19 +740,11 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 		go group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", urltest.ExpectedStatus{}, 0, true, 0)
 	} else {
 		go func() {
-			t, err := urltest.URLTest(boxService.ctx, "", outbound)
-			if err != nil {
-				historyStorage.Failed(outboundTag, "", func(ctx context.Context) (uint16, error) {
-					probeCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
-					defer cancel()
-					return urltest.URLTest(probeCtx, "", outbound)
-				})
-			} else {
-				historyStorage.StoreURLTestHistory(outboundTag, &adapter.URLTestHistory{
-					Time:  time.Now(),
-					Delay: t,
-				})
-			}
+			historyStorage.Probe(boxService.ctx, outboundTag, "", 0, true, func(ctx context.Context) (uint16, error) {
+				probeCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
+				defer cancel()
+				return urltest.URLTest(probeCtx, "", outbound)
+			})
 		}()
 	}
 	return &emptypb.Empty{}, nil

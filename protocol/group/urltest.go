@@ -337,14 +337,14 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	switch network {
 	case N.NetworkTCP:
 		if g.selectedOutboundTCP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundTCP, N.NetworkTCP)); history != nil {
+			if history := g.history.LoadProbeHistory(RealTag(g.selectedOutboundTCP, N.NetworkTCP), g.ProbeLink()); history != nil {
 				minOutbound = g.selectedOutboundTCP
 				minDelay = history.Delay
 			}
 		}
 	case N.NetworkUDP:
 		if g.selectedOutboundUDP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundUDP, N.NetworkUDP)); history != nil {
+			if history := g.history.LoadProbeHistory(RealTag(g.selectedOutboundUDP, N.NetworkUDP), g.ProbeLink()); history != nil {
 				minOutbound = g.selectedOutboundUDP
 				minDelay = history.Delay
 			}
@@ -354,7 +354,7 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		if !common.Contains(detour.Network(), network) {
 			continue
 		}
-		history := g.history.LoadURLTestHistory(RealTag(detour, network))
+		history := g.history.LoadProbeHistory(RealTag(detour, network), g.ProbeLink())
 		if history == nil {
 			continue
 		}
@@ -493,10 +493,12 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 	// Open-Box (tcp20): ten workers take the queued checks in turn instead of one goroutine
 	// per member parked on a slot (openbox_workers.go); same ten at a time as upstream.
 	workers := 10
-	if common.LowMemory { workers = 4 }
+	if common.LowMemory {
+		workers = 4
+	}
 	runBounded(workers, testBatch.tasks)
 	for _, outboundGroup := range testBatch.groups {
-		groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
+		groupHistory := history.LoadProbeHistory(RealTag(outboundGroup, N.NetworkTCP), urltest.ProbeLink(link, expected))
 		if groupHistory != nil {
 			testBatch.result[outboundGroup.Tag()] = groupHistory.Delay
 		}
@@ -516,9 +518,14 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, expected 
 			b.groups = append(b.groups, nested)
 			b.tasks = append(b.tasks, func() {
 				nestedResult, _ := nested.group.urlTest(b.ctx, force, b.memberTimeout)
-				b.access.Lock()
-				maps.Copy(b.result, nestedResult)
-				b.access.Unlock()
+				if urltest.ProbeLink(link, expected) == nested.group.ProbeLink() {
+					b.access.Lock()
+					maps.Copy(b.result, nestedResult)
+					b.access.Unlock()
+				} else {
+					// The child's own test does not prove its chosen leaf works for the parent.
+					b.probe(nested, link, expected, interval, force)
+				}
 			})
 		case adapter.OutboundGroup:
 			b.checked[tag] = true
@@ -529,33 +536,37 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, expected 
 			})), link, expected, interval, force)
 		default:
 			b.checked[tag] = true
-			b.tasks = append(b.tasks, func() {
-				result := b.history.Probe(b.ctx, tag, urltest.ProbeLink(link, expected), interval, force, func(ctx context.Context) (uint16, error) {
-					// Each member gets its own timeout, detached from the request's deadline:
-					// with ten members probed at a time a group with many dead members outlives
-					// any single request bound. Deriving from the request context made every
-					// member still pending fail at once and lose its history, leaving the group
-					// nothing to select (observed on a production router: six live members
-					// recorded as timed out in one second). A member that fails now really
-					// failed within its own timeout.
-					// Probe paces this against the kernel-wide budget (common/urltest/pacer.go)
-					// before calling here, so the member timeout starts once the slot is ours.
-					testCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.memberTimeout)
-					defer cancel()
-					return urltest.URLTestExpected(testCtx, link, expected, detour)
-				})
-				if result.Err != nil {
-					b.logger.Debug("outbound ", tag, " unavailable: ", result.Err)
-				} else {
-					if !result.Reused {
-						b.logger.Debug("outbound ", tag, " available: ", result.Delay, "ms")
-					}
-					b.access.Lock()
-					b.result[tag] = result.Delay
-					b.access.Unlock()
-				}
-			})
+			b.tasks = append(b.tasks, func() { b.probe(detour, link, expected, interval, force) })
 		}
+	}
+}
+
+func (b *urlTestBatch) probe(detour adapter.Outbound, link string, expected urltest.ExpectedStatus, interval time.Duration, force bool) {
+	tag := RealTag(detour, N.NetworkTCP)
+	if leaf, loaded := b.outbound.Outbound(tag); loaded { detour = leaf }
+	result := b.history.Probe(b.ctx, tag, urltest.ProbeLink(link, expected), interval, force, func(ctx context.Context) (uint16, error) {
+		// Each member gets its own timeout, detached from the request's deadline:
+		// with ten members probed at a time a group with many dead members outlives
+		// any single request bound. Deriving from the request context made every
+		// member still pending fail at once and lose its history, leaving the group
+		// nothing to select (observed on a production router: six live members
+		// recorded as timed out in one second). A member that fails now really
+		// failed within its own timeout.
+		// Probe paces this against the kernel-wide budget (common/urltest/pacer.go)
+		// before calling here, so the member timeout starts once the slot is ours.
+		testCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.memberTimeout)
+		defer cancel()
+		return urltest.URLTestExpected(testCtx, link, expected, detour)
+	})
+	if result.Err != nil {
+		b.logger.Debug("outbound ", tag, " unavailable: ", result.Err)
+	} else {
+		if !result.Reused {
+			b.logger.Debug("outbound ", tag, " available: ", result.Delay, "ms")
+		}
+		b.access.Lock()
+		b.result[tag] = result.Delay
+		b.access.Unlock()
 	}
 }
 
@@ -576,6 +587,10 @@ func (g *URLTestGroup) SelectedTags() []string {
 	return tags
 }
 
+func (g *URLTestGroup) ProbeLink() string {
+	return urltest.ProbeLink(g.link, g.expected)
+}
+
 func (g *URLTestGroup) Reselect() {
 	g.performUpdateCheck()
 }
@@ -585,7 +600,12 @@ func (g *URLTestGroup) Reselect() {
 // delay and only dropped if it fails again.
 func (g *URLTestGroup) confirmFailure(outbound adapter.Outbound, network string) {
 	link, expected := g.link, g.expected
-	g.history.Failed(RealTag(outbound, network), urltest.ProbeLink(link, expected), func(ctx context.Context) (uint16, error) {
+	tag := RealTag(outbound, network)
+	// A nested group may select another leaf during the ten-second delay.
+	if leaf, loaded := g.outbound.Outbound(tag); loaded {
+		outbound = leaf
+	}
+	g.history.Failed(tag, urltest.ProbeLink(link, expected), func(ctx context.Context) (uint16, error) {
 		probeCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
 		defer cancel()
 		return urltest.URLTestExpected(probeCtx, link, expected, outbound)

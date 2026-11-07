@@ -21,6 +21,9 @@ type newerThanKey struct{}
 
 type confirmingKey struct{}
 
+// A pending recheck must not publish results for an outbound replaced in place.
+type probeEpochKey struct{}
+
 // WithNewerThan makes Probe accept any result for the member completed after t,
 // even under force, and join one in flight: "a result newer than the failure" is
 // the recheck, whoever produced it (Open-Box tcp14, see confirm.go). "After" counts
@@ -60,8 +63,10 @@ func confirmingOf(ctx context.Context) bool {
 }
 
 type probeEntry struct {
-	done   chan struct{}
-	result ProbeResult
+	done    chan struct{}
+	result  ProbeResult
+	history *adapter.URLTestHistory // last valid pass for this exact probe key
+	epoch   *byte                   // shared by successive probes until the outbound is invalidated
 	// ticket is the entry's place in the probe queue (pacer.go) while it waits for
 	// a slot; an interactive caller joining a queued background probe moves it up.
 	ticket *pacerTicket
@@ -77,6 +82,11 @@ func (s *HistoryStorage) Probe(ctx context.Context, tag, link string, interval t
 	}
 	key := probeKey{tag, link}
 	s.probeAccess.Lock()
+	previous := s.probes[key]
+	if epoch, ok := ctx.Value(probeEpochKey{}).(*byte); ok && (previous == nil || previous.epoch != epoch) {
+		s.probeAccess.Unlock()
+		return ProbeResult{Err: context.Canceled}
+	}
 	if s.probes == nil {
 		s.probes = make(map[probeKey]*probeEntry)
 	}
@@ -105,7 +115,10 @@ func (s *HistoryStorage) Probe(ctx context.Context, tag, link string, interval t
 			}
 		}
 	}
-	entry := &probeEntry{done: make(chan struct{})}
+	entry := &probeEntry{done: make(chan struct{}), epoch: new(byte)}
+	if previous != nil {
+		entry.history, entry.epoch = previous.history, previous.epoch
+	}
 	s.probes[key] = entry
 	// Kernel-wide probe budget (pacer.go). The entry is registered first, so callers
 	// for the same member join it while it waits for a slot instead of queueing twice.
@@ -118,18 +131,19 @@ func (s *HistoryStorage) Probe(ctx context.Context, tag, link string, interval t
 	delay, err := run(ctx)
 	s.probePacer().release(ticket)
 	result := ProbeResult{Time: time.Now(), Delay: delay, Err: err}
-	// Publish history before releasing waiters. Cache reads and overlapping
-	// requests preserve the original completion time rather than creating samples.
-	if err != nil {
-		if !confirmingOf(ctx) {
-			s.Failed(tag, link, run)
-		}
-	} else {
-		s.StoreURLTestHistory(tag, &adapter.URLTestHistory{Time: result.Time, Delay: delay})
-	}
+	// Publish only if this outbound has not been invalidated during the probe.
+	// Retain the scoped pass on the first failure until its confirmation settles.
 	s.probeAccess.Lock()
+	current := s.probes[key] == entry
+	if current && err == nil {
+		entry.history = &adapter.URLTestHistory{Time: result.Time, Delay: delay}
+		s.StoreURLTestHistory(tag, entry.history)
+	}
 	entry.result = result
 	close(entry.done)
 	s.probeAccess.Unlock()
+	if current && err != nil && !confirmingOf(ctx) {
+		s.failed(tag, link, run, result.Time)
+	}
 	return result
 }

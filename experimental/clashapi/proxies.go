@@ -149,7 +149,21 @@ func getProxies(server *Server) func(w http.ResponseWriter, r *http.Request) {
 func getProxy(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
-		response, err := proxyInfo(server, proxy).MarshalJSON()
+		info := proxyInfo(server, proxy)
+		if link := r.URL.Query().Get("url"); link != "" {
+			expected, err := urltest.ParseExpectedStatus(r.URL.Query().Get("expected"))
+			if err != nil {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, ErrBadRequest)
+				return
+			}
+			tag := group.RealTag(proxy, N.NetworkTCP)
+			info.Put("probe", map[string]any{
+				"tag": tag, "url": link, "expected": expected.String(),
+				"history": server.urlTestHistory.LoadProbeHistory(tag, urltest.ProbeLink(link, expected)),
+			})
+		}
+		response, err := info.MarshalJSON()
 		if err != nil {
 			render.Status(r, http.StatusInternalServerError)
 			render.JSON(w, r, newError(err.Error()))
