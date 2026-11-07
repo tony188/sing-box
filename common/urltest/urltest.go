@@ -109,7 +109,14 @@ func URLTestExpected(ctx context.Context, link string, expected ExpectedStatus, 
 	return urlTest(ctx, link, expected, detour)
 }
 
-func urlTest(ctx context.Context, link string, expected ExpectedStatus, detour N.Dialer) (t uint16, err error) {
+func urlTest(ctx context.Context, link string, expected ExpectedStatus, detour N.Dialer) (uint16, error) {
+	// HEAD and a possible GET share one timeout, including dialing and TLS.
+	ctx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
+	defer cancel()
+	return urlTestMethod(ctx, link, expected, detour, http.MethodHead)
+}
+
+func urlTestMethod(ctx context.Context, link string, expected ExpectedStatus, detour N.Dialer, method string) (t uint16, err error) {
 	if link == "" {
 		link = "http://www.gstatic.com/generate_204"
 	}
@@ -137,7 +144,7 @@ func urlTest(ctx context.Context, link string, expected ExpectedStatus, detour N
 	if N.NeedHandshakeForWrite(instance) {
 		start = time.Now()
 	}
-	req, err := http.NewRequest(http.MethodHead, link, nil)
+	req, err := http.NewRequest(method, link, nil)
 	if err != nil {
 		return
 	}
@@ -162,6 +169,12 @@ func urlTest(ctx context.Context, link string, expected ExpectedStatus, detour N
 		return
 	}
 	resp.Body.Close()
+	if method == http.MethodHead && (resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotImplemented) {
+		// Some sites only implement GET. Close HEAD's connection before retrying
+		// through the same outbound. Do not follow redirects or read the body.
+		instance.Close()
+		return urlTestMethod(ctx, link, expected, detour, http.MethodGet)
+	}
 	if !expected.Match(resp.StatusCode) {
 		err = E.New("unexpected status ", resp.StatusCode)
 		return
