@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-mux"
 	"github.com/sagernet/sing-snell"
 	"github.com/sagernet/sing/common"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
@@ -88,21 +89,27 @@ func (s *HistoryStorage) Close() error {
 }
 
 func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) {
+	return URLTestExpected(ctx, link, ExpectedStatus{}, detour)
+}
+
+// URLTestExpected is URLTest with the statuses that count as a pass (Open-Box
+// tcp19, expected.go): any other response fails the test, as a timeout would.
+func URLTestExpected(ctx context.Context, link string, expected ExpectedStatus, detour N.Dialer) (uint16, error) {
 	multiplexOutbound, isMultiplexOutbound := common.Cast[adapter.OutboundWithMultiplex](detour)
 	if isMultiplexOutbound && multiplexOutbound.MultiplexEnabled() {
 		warmContext := adapter.ContextWithKeepSession(ctx)
 		warmContext = mux.ContextWithKeepSession(warmContext)
 		warmContext = contextWithQUICKeepSession(warmContext)
 		warmContext = snell.ContextWithKeepSession(warmContext)
-		_, err := urlTest(warmContext, link, detour)
+		_, err := urlTest(warmContext, link, expected, detour)
 		if err != nil {
 			return 0, err
 		}
 	}
-	return urlTest(ctx, link, detour)
+	return urlTest(ctx, link, expected, detour)
 }
 
-func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err error) {
+func urlTest(ctx context.Context, link string, expected ExpectedStatus, detour N.Dialer) (t uint16, err error) {
 	if link == "" {
 		link = "http://www.gstatic.com/generate_204"
 	}
@@ -155,6 +162,10 @@ func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		return
 	}
 	resp.Body.Close()
+	if !expected.Match(resp.StatusCode) {
+		err = E.New("unexpected status ", resp.StatusCode)
+		return
+	}
 	// A successful sub-millisecond HTTP probe must not look unavailable to
 	// Clash API clients, which reserve zero for failed tests.
 	t = uint16(max(1, time.Since(start)/time.Millisecond))

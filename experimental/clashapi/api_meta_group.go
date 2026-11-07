@@ -71,6 +71,14 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			render.JSON(w, r, ErrBadRequest)
 			return
 		}
+		// Open-Box (tcp19): `expected` for the members of a selector group, like `url`;
+		// a URL test group tests with its own link and expected_status.
+		expected, err := urltest.ParseExpectedStatus(query.Get("expected"))
+		if err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, ErrBadRequest)
+			return
+		}
 		force := true
 		if value := query.Get("force"); value != "" {
 			force, err = strconv.ParseBool(value)
@@ -129,7 +137,7 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 				itOutbound, _ := server.outbound.Outbound(it)
 				return itOutbound
 			}))
-			result = group.URLTestOutbounds(ctx, server.outbound, server.urlTestHistory, server.logger, outbounds, url, 0, force, memberTimeout)
+			result = group.URLTestOutbounds(ctx, server.outbound, server.urlTestHistory, server.logger, outbounds, url, expected, 0, force, memberTimeout)
 		}
 
 		if err != nil {

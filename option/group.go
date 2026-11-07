@@ -15,4 +15,7 @@ type URLTestOutboundOptions struct {
 	Tolerance                 uint16             `json:"tolerance,omitempty"`
 	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
 	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
+	// Open-Box (tcp19): statuses that count as a pass, written like mihomo's
+	// expected-status ("200-399/204"); empty or "*" accepts any response.
+	ExpectedStatus string `json:"expected_status,omitempty"`
 }

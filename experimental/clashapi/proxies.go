@@ -222,6 +222,14 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			render.JSON(w, r, ErrBadRequest)
 			return
 		}
+		// Open-Box (tcp19): `expected` = statuses that count as a pass, as mihomo's
+		// expected-status ("200-399/204"); empty or "*" accepts any response.
+		expected, err := urltest.ParseExpectedStatus(query.Get("expected"))
+		if err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, ErrBadRequest)
+			return
+		}
 
 		force := true
 		if value := query.Get("force"); value != "" {
@@ -275,10 +283,10 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			}
 			ctx = urltest.WithNewerThan(ctx, time.UnixMilli(since))
 		}
-		result := server.urlTestHistory.Probe(ctx, realTag, url, time.Millisecond*time.Duration(interval), force, func(ctx context.Context) (uint16, error) {
+		result := server.urlTestHistory.Probe(ctx, realTag, urltest.ProbeLink(url, expected), time.Millisecond*time.Duration(interval), force, func(ctx context.Context) (uint16, error) {
 			probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 			defer cancel()
-			return urltest.URLTest(probeCtx, url, proxy)
+			return urltest.URLTestExpected(probeCtx, url, expected, proxy)
 		})
 		delay, err := result.Delay, result.Err
 		defer func() {

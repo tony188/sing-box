@@ -43,6 +43,7 @@ type URLTest struct {
 	logger                       log.ContextLogger
 	tags                         []string
 	link                         string
+	expected                     urltest.ExpectedStatus
 	interval                     time.Duration
 	tolerance                    uint16
 	idleTimeout                  time.Duration
@@ -52,6 +53,10 @@ type URLTest struct {
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
+	expected, err := urltest.ParseExpectedStatus(options.ExpectedStatus)
+	if err != nil {
+		return nil, E.Cause(err, "parse expected_status")
+	}
 	outbound := &URLTest{
 		Adapter:                      outbound.NewAdapter(C.TypeURLTest, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:                          ctx,
@@ -59,6 +64,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		logger:                       logger,
 		tags:                         options.Outbounds,
 		link:                         options.URL,
+		expected:                     expected,
 		interval:                     time.Duration(options.Interval),
 		tolerance:                    options.Tolerance,
 		idleTimeout:                  time.Duration(options.IdleTimeout),
@@ -86,7 +92,7 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 			outbounds = append(outbounds, detour)
 		}
-		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
+		group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.expected, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
 		if err != nil {
 			return err
 		}
@@ -226,6 +232,7 @@ type URLTestGroup struct {
 	logger                       log.Logger
 	outbounds                    []adapter.Outbound
 	link                         string
+	expected                     urltest.ExpectedStatus
 	interval                     time.Duration
 	tolerance                    uint16
 	idleTimeout                  time.Duration
@@ -245,7 +252,7 @@ type URLTestGroup struct {
 	unregisterConfirm            func()
 }
 
-func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
+func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, expected urltest.ExpectedStatus, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
 	if interval == 0 {
 		interval = C.DefaultURLTestInterval
 	}
@@ -268,6 +275,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		logger:                       logger,
 		outbounds:                    outbounds,
 		link:                         link,
+		expected:                     expected,
 		interval:                     interval,
 		tolerance:                    tolerance,
 		idleTimeout:                  idleTimeout,
@@ -436,7 +444,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool, memberTimeout ti
 	check := &groupCheck{done: make(chan struct{})}
 	g.checkRunning = check
 	g.checkAccess.Unlock()
-	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force, memberTimeout)
+	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.expected, g.interval, force, memberTimeout)
 	g.performUpdateCheck()
 	g.checkAccess.Lock()
 	check.result = result
@@ -467,7 +475,9 @@ type urlTestBatch struct {
 
 // memberTimeout bounds each member's own probe; 0 means C.TCPTimeout (the kernel's
 // own background checks). The Clash API passes the panel's latency test timeout.
-func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, memberTimeout time.Duration) map[string]uint16 {
+// expected: the statuses that count as a pass (Open-Box tcp19); nested URL test
+// groups test with their own link and expectation.
+func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, expected urltest.ExpectedStatus, interval time.Duration, force bool, memberTimeout time.Duration) map[string]uint16 {
 	if memberTimeout <= 0 {
 		memberTimeout = C.TCPTimeout
 	}
@@ -482,7 +492,7 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 		result:        make(map[string]uint16),
 		memberTimeout: memberTimeout,
 	}
-	testBatch.test(outbounds, link, interval, force)
+	testBatch.test(outbounds, link, expected, interval, force)
 	b.Wait()
 	for _, outboundGroup := range testBatch.groups {
 		groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
@@ -493,7 +503,7 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 	return testBatch.result
 }
 
-func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval time.Duration, force bool) {
+func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, expected urltest.ExpectedStatus, interval time.Duration, force bool) {
 	for _, detour := range outbounds {
 		tag := detour.Tag()
 		if b.checked[tag] {
@@ -516,11 +526,11 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.test(common.FilterNotNil(common.Map(nested.All(), func(it string) adapter.Outbound {
 				member, _ := b.outbound.Outbound(it)
 				return member
-			})), link, interval, force)
+			})), link, expected, interval, force)
 		default:
 			b.checked[tag] = true
 			b.batch.Go(tag, func() (any, error) {
-				result := b.history.Probe(b.ctx, tag, link, interval, force, func(ctx context.Context) (uint16, error) {
+				result := b.history.Probe(b.ctx, tag, urltest.ProbeLink(link, expected), interval, force, func(ctx context.Context) (uint16, error) {
 					// Each member gets its own timeout, detached from the request's deadline:
 					// with ten members probed at a time a group with many dead members outlives
 					// any single request bound. Deriving from the request context made every
@@ -532,7 +542,7 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 					// before calling here, so the member timeout starts once the slot is ours.
 					testCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.memberTimeout)
 					defer cancel()
-					return urltest.URLTest(testCtx, link, detour)
+					return urltest.URLTestExpected(testCtx, link, expected, detour)
 				})
 				if result.Err != nil {
 					b.logger.Debug("outbound ", tag, " unavailable: ", result.Err)
@@ -575,11 +585,11 @@ func (g *URLTestGroup) Reselect() {
 // just failed through": the member in use is probed again after the confirmation
 // delay and only dropped if it fails again.
 func (g *URLTestGroup) confirmFailure(outbound adapter.Outbound, network string) {
-	link := g.link
-	g.history.Failed(RealTag(outbound, network), link, func(ctx context.Context) (uint16, error) {
+	link, expected := g.link, g.expected
+	g.history.Failed(RealTag(outbound, network), urltest.ProbeLink(link, expected), func(ctx context.Context) (uint16, error) {
 		probeCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
 		defer cancel()
-		return urltest.URLTest(probeCtx, link, outbound)
+		return urltest.URLTestExpected(probeCtx, link, expected, outbound)
 	})
 }
 
