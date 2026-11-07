@@ -2,6 +2,7 @@ package urltest
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -64,12 +65,13 @@ func confirmingOf(ctx context.Context) bool {
 }
 
 type probeEntry struct {
-	generation uint64
-	previous   ProbeResult
-	done       chan struct{}
-	result     ProbeResult
-	history    *adapter.URLTestHistory // last valid pass for this exact probe key
-	epoch      *byte                   // shared by successive probes until the outbound is invalidated
+	generation  uint64
+	previous    ProbeResult
+	done        chan struct{}
+	result      ProbeResult
+	history     *adapter.URLTestHistory // last valid pass for this exact probe key
+	epoch       *byte                   // shared by successive probes until the outbound is invalidated
+	invalidated chan struct{}           // wakes obsolete queued owners and callers sharing their result
 	// ticket is the entry's place in the probe queue (pacer.go) while it waits for
 	// a slot; an interactive caller joining a queued background probe moves it up.
 	ticket *pacerTicket
@@ -85,6 +87,10 @@ func (s *HistoryStorage) Probe(ctx context.Context, tag, link string, interval t
 	}
 	key := probeKey{tag, link}
 	s.probeAccess.Lock()
+	if s.probeClosed {
+		s.probeAccess.Unlock()
+		return ProbeResult{Err: context.Canceled}
+	}
 	previous := s.probes[key]
 	if epoch, ok := ctx.Value(probeEpochKey{}).(*byte); ok && (previous == nil || previous.epoch != epoch) {
 		s.probeAccess.Unlock()
@@ -110,20 +116,30 @@ func (s *HistoryStorage) Probe(ctx context.Context, tag, link string, interval t
 			s.probeAccess.Unlock()
 			select {
 			case <-entry.done:
+				select {
+				case <-entry.invalidated:
+					return ProbeResult{Err: context.Canceled}
+				default:
+				}
 				result := entry.result
 				result.Reused = true
 				return result
 			case <-ctx.Done():
 				return ProbeResult{Err: ctx.Err()}
+			case <-entry.invalidated:
+				return ProbeResult{Err: context.Canceled}
 			}
 		}
 	}
 	if previous == nil {
 		s.pruneProbesLocked()
 	}
-	entry := &probeEntry{done: make(chan struct{}), epoch: new(byte), generation: newProbeIdentity()}
+	entry := &probeEntry{done: make(chan struct{}), invalidated: make(chan struct{}), epoch: new(byte), generation: newProbeIdentity()}
 	if previous != nil {
 		entry.history, entry.epoch, entry.generation = previous.history, previous.epoch, previous.generation
+		if previous.invalidated != nil {
+			entry.invalidated = previous.invalidated
+		}
 		entry.previous = previous.result
 		if entry.previous.Time.IsZero() {
 			entry.previous = previous.previous
@@ -134,26 +150,34 @@ func (s *HistoryStorage) Probe(ctx context.Context, tag, link string, interval t
 	// for the same member join it while it waits for a slot instead of queueing twice.
 	// run sets its own timeout (each caller's closure does), so waiting for the slot
 	// never eats into it.
-	ticket := s.probePacer().enqueueOwner(PriorityOf(ctx), link)
+	ticket := s.probePacer().enqueueValid(PriorityOf(ctx), link, entry.invalidated)
 	entry.ticket = ticket
 	s.probeAccess.Unlock()
-	s.probePacer().wait(ticket)
-	status := 0
-	delay, err := run(context.WithValue(ctx, httpStatusKey{}, &status))
-	s.probePacer().release(ticket)
-	result := ProbeResult{Time: time.Now(), Delay: delay, Err: err, Status: status}
+	result := ProbeResult{Err: context.Canceled}
+	if s.probePacer().waitValid(ticket, entry.invalidated) {
+		status := 0
+		delay, err := run(context.WithValue(ctx, httpStatusKey{}, &status))
+		result = ProbeResult{Time: time.Now(), Delay: delay, Err: err, Status: status}
+		if errors.Is(err, context.Canceled) {
+			result = ProbeResult{Err: context.Canceled}
+		}
+		s.probePacer().release(ticket)
+	}
 	// Publish only if this outbound has not been invalidated during the probe.
 	// Retain the scoped pass on the first failure until its confirmation settles.
 	s.probeAccess.Lock()
-	current := s.probes[key] == entry
-	if current && err == nil {
-		entry.history = &adapter.URLTestHistory{Time: result.Time, Delay: delay}
+	current := !s.probeClosed && s.probes[key] == entry
+	if !current {
+		result = ProbeResult{Err: context.Canceled}
+	}
+	if current && result.Err == nil {
+		entry.history = &adapter.URLTestHistory{Time: result.Time, Delay: result.Delay}
 		s.StoreURLTestHistory(tag, entry.history)
 	}
 	entry.result = result
 	close(entry.done)
 	s.probeAccess.Unlock()
-	if current && err != nil && !confirmingOf(ctx) {
+	if current && result.Err != nil && !errors.Is(result.Err, context.Canceled) && !confirmingOf(ctx) {
 		s.failed(tag, link, run, result.Time)
 	}
 	return result

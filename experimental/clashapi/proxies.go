@@ -298,11 +298,19 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			ctx = urltest.WithNewerThan(ctx, time.UnixMilli(since))
 		}
 		result := server.urlTestHistory.Probe(ctx, realTag, urltest.ProbeLink(url, expected), time.Millisecond*time.Duration(interval), force, func(ctx context.Context) (uint16, error) {
+			if current, loaded := server.outbound.Outbound(realTag); !loaded || current != proxy {
+				return 0, context.Canceled
+			}
 			probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 			defer cancel()
 			return urltest.URLTestExpected(probeCtx, url, expected, proxy)
 		})
 		delay, err := result.Delay, result.Err
+		if errors.Is(err, context.Canceled) {
+			render.Status(r, http.StatusConflict)
+			render.JSON(w, r, render.M{"message": "Probe invalidated", "error": err.Error()})
+			return
+		}
 		defer func() {
 			for _, detour := range server.outbound.Outbounds() {
 				urlTestGroup, isURLTestGroup := detour.(adapter.URLTestGroup)

@@ -230,6 +230,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 
 type URLTestGroup struct {
 	ctx                          context.Context
+	cancel                       context.CancelFunc
 	outbound                     adapter.OutboundManager
 	pause                        pause.Manager
 	pauseCallback                *list.Element[pause.Callback]
@@ -273,8 +274,10 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 	if history == nil {
 		return nil, E.New("missing URL test history storage")
 	}
+	ctx, cancel := context.WithCancel(ctx)
 	return &URLTestGroup{
 		ctx:                          ctx,
+		cancel:                       cancel,
 		outbound:                     outboundManager,
 		logger:                       logger,
 		outbounds:                    outbounds,
@@ -294,6 +297,9 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 func (g *URLTestGroup) PostStart() {
 	g.access.Lock()
 	defer g.access.Unlock()
+	if g.ctx.Err() != nil {
+		return
+	}
 	g.started = true
 	g.lastActive.Store(time.Now())
 	if g.unregisterConfirm == nil {
@@ -308,6 +314,9 @@ func (g *URLTestGroup) Touch() {
 	}
 	g.access.Lock()
 	defer g.access.Unlock()
+	if g.ctx != nil && g.ctx.Err() != nil {
+		return
+	}
 	if g.ticker != nil {
 		g.lastActive.Store(time.Now())
 		return
@@ -321,6 +330,16 @@ func (g *URLTestGroup) Touch() {
 func (g *URLTestGroup) Close() error {
 	g.access.Lock()
 	defer g.access.Unlock()
+	if g.cancel != nil {
+		g.cancel()
+	}
+	if g.close != nil {
+		select {
+		case <-g.close:
+		default:
+			close(g.close)
+		}
+	}
 	if g.unregisterConfirm != nil {
 		g.unregisterConfirm()
 		g.unregisterConfirm = nil
@@ -332,7 +351,6 @@ func (g *URLTestGroup) Close() error {
 	g.ticker = nil
 	g.pause.UnregisterCallback(g.pauseCallback)
 	g.pauseCallback = nil
-	close(g.close)
 	return nil
 }
 
@@ -422,7 +440,17 @@ type groupCheck struct {
 	complete bool
 }
 
+type probeGroupLifetimeKey struct{}
+
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool, memberTimeout time.Duration) (map[string]uint16, error) {
+	if g.ctx != nil {
+		if err := g.ctx.Err(); err != nil {
+			return make(map[string]uint16), err
+		}
+		// The group lifetime is separate from a request's timeout. A hot-retired
+		// group must stop submitting new work; a detached HTTP caller need not.
+		ctx = context.WithValue(ctx, probeGroupLifetimeKey{}, g.ctx)
+	}
 	for {
 		g.checkAccess.Lock()
 		running := g.checkRunning
@@ -440,6 +468,8 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool, memberTimeout ti
 		case <-running.done:
 		case <-ctx.Done():
 			return make(map[string]uint16), ctx.Err()
+		case <-g.close:
+			return make(map[string]uint16), context.Canceled
 		}
 		if running.complete {
 			return maps.Clone(running.result), nil
@@ -449,13 +479,19 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool, memberTimeout ti
 	g.checkRunning = check
 	g.checkAccess.Unlock()
 	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.expected, g.interval, force, memberTimeout)
-	g.performUpdateCheck()
+	active := g.ctx == nil || g.ctx.Err() == nil
+	if active {
+		g.performUpdateCheck()
+	}
 	g.checkAccess.Lock()
 	check.result = result
-	check.complete = ctx.Err() == nil
+	check.complete = active && ctx.Err() == nil
 	g.checkRunning = nil
 	close(check.done)
 	g.checkAccess.Unlock()
+	if !active {
+		return result, context.Canceled
+	}
 	return result, nil
 }
 
@@ -547,11 +583,27 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, expected 
 }
 
 func (b *urlTestBatch) probe(detour adapter.Outbound, link string, expected urltest.ExpectedStatus, interval time.Duration, force bool) {
+	if lifetime, ok := b.ctx.Value(probeGroupLifetimeKey{}).(context.Context); ok && lifetime.Err() != nil {
+		return
+	}
 	tag := RealTag(detour, N.NetworkTCP)
 	if leaf, loaded := b.outbound.Outbound(tag); loaded {
+		if _, nested := detour.(adapter.OutboundGroup); !nested && leaf != detour {
+			return
+		}
 		detour = leaf
+	} else {
+		return
 	}
 	result := b.history.Probe(b.ctx, tag, urltest.ProbeLink(link, expected), interval, force, func(ctx context.Context) (uint16, error) {
+		// Replacement may have happened between the batch's lookup and queue
+		// registration. Check again after admission, before opening any socket.
+		if lifetime, ok := b.ctx.Value(probeGroupLifetimeKey{}).(context.Context); ok && lifetime.Err() != nil {
+			return 0, context.Canceled
+		}
+		if current, loaded := b.outbound.Outbound(tag); !loaded || current != detour {
+			return 0, context.Canceled
+		}
 		// Each member gets its own timeout, detached from the request's deadline:
 		// with ten members probed at a time a group with many dead members outlives
 		// any single request bound. Deriving from the request context made every
@@ -609,11 +661,15 @@ func (g *URLTestGroup) confirmFailure(outbound adapter.Outbound, network string)
 	link, expected := g.link, g.expected
 	tag := RealTag(outbound, network)
 	// A nested group may select another leaf during the ten-second delay.
-	if frozen, ok := outbound.(*frozenDialOutbound); ok { outbound = frozen.Outbound }
+	if frozen, ok := outbound.(*frozenDialOutbound); ok {
+		outbound = frozen.Outbound
+	}
 	if leaf, loaded := g.outbound.Outbound(tag); loaded {
-        // A late failure from an old in-flight dial must not confirm the new
-        // outbound created under the same tag by a hot replacement.
-        if _, nested := outbound.(adapter.OutboundGroup); !nested && leaf != outbound { return }
+		// A late failure from an old in-flight dial must not confirm the new
+		// outbound created under the same tag by a hot replacement.
+		if _, nested := outbound.(adapter.OutboundGroup); !nested && leaf != outbound {
+			return
+		}
 		outbound = leaf
 	}
 	g.history.Failed(tag, urltest.ProbeLink(link, expected), func(ctx context.Context) (uint16, error) {

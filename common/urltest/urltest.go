@@ -24,6 +24,7 @@ import (
 type HistoryStorage struct {
 	probeInstance string
 	probeRevision uint64
+	probeClosed   bool
 	probeAccess   sync.Mutex
 	probes        map[probeKey]*probeEntry
 	access        sync.RWMutex
@@ -67,8 +68,11 @@ func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
 	// Hot replacement/removal invalidates every condition and any old in-flight result.
 	s.probeAccess.Lock()
 	s.probeRevision++
-	for key := range s.probes {
+	for key, entry := range s.probes {
 		if key.tag == tag {
+			if entry.invalidated != nil {
+				close(entry.invalidated)
+			}
 			delete(s.probes, key)
 		}
 	}
@@ -94,6 +98,15 @@ func (s *HistoryStorage) notifyUpdated() {
 }
 
 func (s *HistoryStorage) Close() error {
+	s.probeAccess.Lock()
+	s.probeClosed = true
+	for key, entry := range s.probes {
+		if entry.invalidated != nil {
+			close(entry.invalidated)
+		}
+		delete(s.probes, key)
+	}
+	s.probeAccess.Unlock()
 	s.closeConfirm()
 	s.access.Lock()
 	defer s.access.Unlock()

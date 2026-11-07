@@ -138,9 +138,13 @@ func (s *HistoryStorage) failed(tag, link string, probe func(ctx context.Context
 	}
 	// Keep lock order consistent with outbound invalidation: probe -> confirmation.
 	s.probeAccess.Lock()
+	if s.probeClosed {
+		s.probeAccess.Unlock()
+		return false
+	}
 	entry := s.probes[probeKey{tag, link}]
 	if entry == nil {
- s.pruneProbesLocked()
+		s.pruneProbesLocked()
 		if s.probes == nil {
 			s.probes = make(map[probeKey]*probeEntry)
 		}

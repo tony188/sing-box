@@ -78,10 +78,12 @@ func PriorityOf(ctx context.Context) ProbePriority {
 }
 
 type pacerTicket struct {
-	grant    chan time.Time
-	priority ProbePriority
-	owner    string
-	queued   bool
+	grant       chan time.Time
+	priority    ProbePriority
+	owner       string
+	queued      bool
+	finished    bool
+	invalidated <-chan struct{}
 	// background: the ticket holds one of the background slots (fixed at start)
 	background bool
 }
@@ -135,6 +137,13 @@ func (p *probePacer) reserveStartLocked() time.Time {
 }
 
 func (p *probePacer) startLocked(ticket *pacerTicket) {
+	select {
+	case <-ticket.invalidated:
+		ticket.queued = false
+		ticket.finished = true
+		return
+	default:
+	}
 	p.running++
 	p.lastOwner[ticket.priority] = ticket.owner
 	if ticket.priority == PriorityInteractive {
@@ -205,7 +214,11 @@ func (p *probePacer) enqueue(priority ProbePriority) *pacerTicket {
 	return p.enqueueOwner(priority, "")
 }
 func (p *probePacer) enqueueOwner(priority ProbePriority, owner string) *pacerTicket {
-	ticket := &pacerTicket{grant: make(chan time.Time, 1), priority: priority, owner: owner}
+	return p.enqueueValid(priority, owner, nil)
+}
+
+func (p *probePacer) enqueueValid(priority ProbePriority, owner string, invalidated <-chan struct{}) *pacerTicket {
+	ticket := &pacerTicket{grant: make(chan time.Time, 1), priority: priority, owner: owner, invalidated: invalidated}
 	p.access.Lock()
 	defer p.access.Unlock()
 	waitingAhead := false
@@ -226,9 +239,42 @@ func (p *probePacer) enqueueOwner(priority ProbePriority, owner string) *pacerTi
 
 // wait blocks until the ticket holds a slot and its start time has come.
 func (p *probePacer) wait(ticket *pacerTicket) {
-	start := <-ticket.grant
+	p.waitValid(ticket, nil)
+}
+
+// A node replaced while queued must not dial later or delay the new generation.
+// Caller/request cancellation is deliberately separate: shared live work retains
+// its own per-member timeout even if one HTTP caller stops waiting for it.
+func (p *probePacer) waitValid(ticket *pacerTicket, invalidated <-chan struct{}) bool {
+	select {
+	case <-invalidated:
+		p.release(ticket)
+		return false
+	default:
+	}
+	var start time.Time
+	select {
+	case start = <-ticket.grant:
+	case <-invalidated:
+		p.release(ticket)
+		return false
+	}
 	if d := time.Until(start); d > 0 {
-		time.Sleep(d)
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-invalidated:
+			p.release(ticket)
+			return false
+		}
+	}
+	select {
+	case <-invalidated:
+		p.release(ticket)
+		return false
+	default:
+		return true
 	}
 }
 
@@ -236,9 +282,24 @@ func (p *probePacer) wait(ticket *pacerTicket) {
 func (p *probePacer) release(ticket *pacerTicket) {
 	p.access.Lock()
 	defer p.access.Unlock()
-	p.running--
-	if ticket.background {
-		p.runningBackground--
+	if ticket.finished {
+		return
+	}
+	ticket.finished = true
+	if ticket.queued {
+		from := p.queues[ticket.priority]
+		for i, t := range from {
+			if t == ticket {
+				p.queues[ticket.priority] = append(from[:i:i], from[i+1:]...)
+				break
+			}
+		}
+		ticket.queued = false
+	} else {
+		p.running--
+		if ticket.background {
+			p.runningBackground--
+		}
 	}
 	p.dispatchLocked()
 }
