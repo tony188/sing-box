@@ -9,6 +9,7 @@ type SelectorOutboundOptions struct {
 }
 
 type URLTestOutboundOptions struct {
+ Bandwidth bool `json:"bandwidth,omitempty"`
 	Outbounds                 []string           `json:"outbounds" reference:"outbound"`
 	URL                       string             `json:"url,omitempty"`
 	Interval                  badoption.Duration `json:"interval,omitempty"`

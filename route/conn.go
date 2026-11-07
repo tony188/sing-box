@@ -101,6 +101,9 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = adapter.WithContext(ctx, &metadata)
+ bandwidth := m.newBandwidthLease(&metadata)
+ originalClose:=onClose
+ onClose=func(err error){bandwidth.Close();if originalClose!=nil{originalClose(err)}}
 	this = urlTestFallbackDialer(this, metadata.OutboundChain)
  if fallback, ok := this.(*fallbackDialer); ok { ctx = fallback.fallbackContext(ctx) }
 	var (
@@ -131,7 +134,8 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		m.logger.ErrorContext(ctx, err)
 		return
 	}
-	if tracker, ok := common.Cast[interface{ SetOutboundChain([]adapter.Outbound) }](conn); ok {
+	bandwidth.Resolve()
+ if tracker, ok := common.Cast[interface{ SetOutboundChain([]adapter.Outbound) }](conn); ok {
 		tracker.SetOutboundChain(metadata.OutboundChain)
 	}
 	if hasURLTestFallback(metadata.OutboundChain) { onClose = registerInterrupt(metadata.OutboundChain, conn, onClose) }
@@ -171,6 +175,9 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = adapter.WithContext(ctx, &metadata)
+ bandwidth := m.newBandwidthLease(&metadata)
+ originalClose:=onClose
+ onClose=func(err error){bandwidth.Close();if originalClose!=nil{originalClose(err)}}
 	var (
 		remotePacketConn   net.PacketConn
 		remoteConn         net.Conn
@@ -240,7 +247,8 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			return
 		}
 	}
-	err = N.ReportPacketConnHandshakeSuccess(conn, remotePacketConn)
+	bandwidth.Resolve()
+ err = N.ReportPacketConnHandshakeSuccess(conn, remotePacketConn)
 	if err != nil {
 		err = E.Cause(err, "report handshake success")
 		remotePacketConn.Close()

@@ -22,6 +22,8 @@ import (
 )
 
 type HistoryStorage struct {
+ bandwidthOnce sync.Once
+ bandwidth *BandwidthState
 	probeInstance string
 	probeRevision uint64
 	probeClosed   bool

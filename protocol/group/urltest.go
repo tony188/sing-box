@@ -36,6 +36,7 @@ var (
 )
 
 type URLTest struct {
+ bandwidthEnabled bool
 	outbound.Adapter
 	ctx                          context.Context
 	outbound                     adapter.OutboundManager
@@ -59,6 +60,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 	outbound := &URLTest{
 		Adapter:                      outbound.NewAdapter(C.TypeURLTest, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:                          ctx,
+ bandwidthEnabled: options.Bandwidth,
 		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
 		logger:                       logger,
 		tags:                         options.Outbounds,
@@ -95,7 +97,10 @@ func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if err != nil {
 			return err
 		}
-		s.group = group
+		group.bandwidthEnabled = s.bandwidthEnabled
+ group.bandwidthTag = s.Tag()
+ if s.bandwidthEnabled && group.history!=nil {group.history.Bandwidth().Enable()}
+ s.group = group
 	case adapter.StartStateStarted:
 		s.group.PostStart()
 		scope.Add(s.group.Close)
@@ -229,6 +234,10 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 }
 
 type URLTestGroup struct {
+ bandwidthEnabled bool
+ bandwidthTag string
+ bandwidthAccess sync.Mutex
+ bandwidthSince [2]time.Time
 	ctx                          context.Context
 	cancel                       context.CancelFunc
 	outbound                     adapter.OutboundManager
@@ -355,6 +364,8 @@ func (g *URLTestGroup) Close() error {
 }
 
 func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+ old:=g.selectedOutboundTCP; if network==N.NetworkUDP {old=g.selectedOutboundUDP}
+ if selected,ok:=g.selectBandwidth(network,old);ok{return selected,true}
 	var minDelay uint16
 	var minOutbound adapter.Outbound
 	switch network {
